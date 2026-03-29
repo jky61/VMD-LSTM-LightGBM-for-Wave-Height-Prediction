@@ -1,0 +1,414 @@
+"""
+=============================================================================
+VMD-LSTM-LightGBM Hybrid Model for Time-Series Forecasting
+Author: [Your Name/GitHub Handle]
+Description: 
+A synergistic forecasting framework that decomposes non-stationary time-series 
+data using Variational Mode Decomposition (VMD). Low-frequency/trend components 
+are modeled using LightGBM, while high-frequency components are modeled using 
+PyTorch-based LSTM networks.
+
+Note: Core hyperparameters, specific data preprocessing steps, and plotting 
+modules have been masked or removed for this public repository. Users should 
+configure these according to their specific datasets.
+=============================================================================
+"""
+
+import numpy as np
+import pandas as pd
+import os
+import time
+import traceback
+
+# --- PyTorch ---
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+
+# --- Machine Learning & Evaluation ---
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from sklearn.preprocessing import MinMaxScaler
+from vmdpy import VMD
+import lightgbm as lgb
+
+
+# ===================================================================
+# 1. Configuration (Hyperparameters Masked)
+# ===================================================================
+class Config:
+    # --- I/O Paths ---
+    FILE_PATH = 'YOUR_DATA_PATH.csv'
+    OUTPUT_BASE_DIR = 'YOUR_OUTPUT_DIRECTORY'
+
+    # --- Target & Features ---
+    TARGET_COLUMN = 'YOUR_TARGET_COLUMN'
+    TIME_COLUMN = 'YOUR_TIME_COLUMN'
+    EXTERNAL_FEATURES = ['FEATURE_1', 'FEATURE_2']  # Add your external feature names
+    
+    # --- VMD Parameters ---
+    VMD_K = 0        # TODO: Define the number of IMFs
+    VMD_ALPHA = 0    # TODO: Define data-fidelity constraint parameter
+    VMD_TAU = 0.0
+
+    # Define which IMFs are considered low-frequency (to be processed by LightGBM)
+    LOW_FREQ_COMPONENTS = ['IMF_X', 'Residual'] 
+
+    # --- Forecasting Parameters ---
+    FORECAST_HORIZON = 1
+    LOOK_BACK = 0    # TODO: Define sliding window size
+    LSTM_UNITS = 0   # TODO: Define LSTM hidden dimensions
+    EPOCHS = 0       # TODO: Define training epochs
+    BATCH_SIZE = 0   # TODO: Define batch size
+
+    LAGS = []            # e.g., [1, 2, 3]
+    ROLLING_WINDOWS = [] # e.g., [3, 6, 12]
+
+    # --- LightGBM Parameters ---
+    LGB_PARAMS_LOW_FREQ = {
+        'objective': 'regression',
+        'metric': 'rmse',
+        # TODO: Add your specific LightGBM hyperparameters here
+        'verbose': -1, 
+        'n_jobs': -1, 
+        'seed': 42
+    }
+    
+    TRAIN_SIZE_RATIO = 0.8
+    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+# ===================================================================
+# 2. Data Processing & Feature Engineering
+# ===================================================================
+
+def load_and_clean_data(file_path, all_columns_to_load, target_column, time_col):
+    """
+    Load and preprocess multi-variate data.
+    [Data acquisition and cleaning logic has been masked].
+    Users should implement their own loading, missing value imputation, 
+    and outlier removal logic here.
+    """
+    print("--- Loading and cleaning data ---")
+    
+    # Example placeholder logic:
+    # df = pd.read_csv(file_path)
+    # df.dropna(inplace=True)
+    # return df
+    
+    raise NotImplementedError("Please implement your own data loading and cleaning logic.")
+
+
+def decompose_signal(data, target_column, config):
+    """Decompose the target signal using VMD."""
+    print(f"--- Decomposing target into {config.VMD_K} modes using VMD ---")
+    signal = data[target_column].values
+    u, _, _ = VMD(signal, alpha=config.VMD_ALPHA, tau=config.VMD_TAU, K=config.VMD_K, DC=True, init=1, tol=1e-7)
+    imfs = pd.DataFrame(u.T, index=data.index, columns=[f'IMF_{i + 1}' for i in range(config.VMD_K)])
+    imfs.rename(columns={f'IMF_{config.VMD_K}': 'Residual'}, inplace=True)
+    return imfs
+
+
+def create_features_for_lgbm(df, components_to_process, config):
+    """Create lag and rolling window features for LightGBM components."""
+    print(f"--- Creating features for LightGBM ---")
+    features = df.copy()
+    
+    for component in components_to_process:
+        if component in features.columns:
+            for lag in config.LAGS:
+                features[f'{component}_lag_{lag}'] = features[component].shift(lag)
+            for window in config.ROLLING_WINDOWS:
+                features[f'{component}_rolling_mean_{window}'] = features[component].shift(1).rolling(window=window).mean()
+                features[f'{component}_rolling_std_{window}'] = features[component].shift(1).rolling(window=window).std()
+
+    features.dropna(inplace=True)
+    return features
+
+
+def create_lstm_dataset(data, look_back=1, forecast_horizon=1):
+    """Construct sliding window dataset for LSTM."""
+    X, Y = [], []
+    for i in range(len(data) - look_back - forecast_horizon + 1):
+        X.append(data[i:(i + look_back), :])
+        y_index = i + look_back + forecast_horizon - 1
+        Y.append(data[y_index, -1])
+    return np.array(X), np.array(Y)
+
+
+# ===================================================================
+# 3. Model Definitions & Training
+# ===================================================================
+
+class PyTorchLSTM(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim=1, dropout=0.2):
+        super(PyTorchLSTM, self).__init__()
+        self.lstm1 = nn.LSTM(input_dim, hidden_dim, batch_first=True)
+        self.dropout1 = nn.Dropout(dropout)
+        self.lstm2 = nn.LSTM(hidden_dim, hidden_dim // 2, batch_first=True)
+        self.dropout2 = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_dim // 2, output_dim)
+
+    def forward(self, x):
+        out, _ = self.lstm1(x)
+        out = self.dropout1(out)
+        out, _ = self.lstm2(out)
+        out = out[:, -1, :]
+        out = self.dropout2(out)
+        out = self.fc(out)
+        return out
+
+
+class EarlyStoppingPyTorch:
+    """Early stops the training if validation loss doesn't improve after a given patience."""
+    def __init__(self, patience=10, verbose=False, delta=0):
+        self.patience = patience
+        self.verbose = verbose
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.val_loss_min = np.Inf
+        self.delta = delta
+        self.best_state_dict = None
+
+    def __call__(self, val_loss, model):
+        score = -val_loss
+        if self.best_score is None:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model)
+        elif score < self.best_score + self.delta:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model)
+            self.counter = 0
+
+    def save_checkpoint(self, val_loss, model):
+        self.val_loss_min = val_loss
+        self.best_state_dict = model.state_dict()
+
+    def load_best_weights(self, model):
+        if self.best_state_dict is not None:
+            model.load_state_dict(self.best_state_dict)
+
+
+def train_and_predict_lstm(df_train, df_test, component, external_features, config):
+    """Train LSTM on specific IMF and predict the test set."""
+    lstm_cols = external_features + [component]
+    num_features = len(lstm_cols)
+
+    train_data = df_train[lstm_cols].values
+    test_data = df_test[lstm_cols].values
+
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    scaled_train_data = scaler.fit_transform(train_data)
+    scaled_test_data = scaler.transform(test_data)
+
+    target_scaler = MinMaxScaler(feature_range=(0, 1))
+    target_scaler.fit(df_train[[component]])
+
+    X_train, y_train = create_lstm_dataset(scaled_train_data, config.LOOK_BACK, config.FORECAST_HORIZON)
+    X_test, y_test_raw = create_lstm_dataset(scaled_test_data, config.LOOK_BACK, config.FORECAST_HORIZON)
+
+    if len(X_train) == 0 or len(X_test) == 0:
+        return np.array([]), 0
+
+    X_train_tensor = torch.FloatTensor(X_train).to(config.DEVICE)
+    y_train_tensor = torch.FloatTensor(y_train).view(-1, 1).to(config.DEVICE)
+    X_test_tensor = torch.FloatTensor(X_test).to(config.DEVICE)
+    y_test_tensor = torch.FloatTensor(y_test_raw).view(-1, 1).to(config.DEVICE)
+
+    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+    val_dataset = TensorDataset(X_test_tensor, y_test_tensor)
+
+    train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=False)
+    val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE, shuffle=False)
+
+    model = PyTorchLSTM(input_dim=num_features, hidden_dim=config.LSTM_UNITS).to(config.DEVICE)
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=0.001)
+
+    early_stopping = EarlyStoppingPyTorch(patience=10, verbose=False)
+
+    for epoch in range(config.EPOCHS):
+        model.train()
+        for X_batch, y_batch in train_loader:
+            optimizer.zero_grad()
+            output = model(X_batch)
+            loss = criterion(output, y_batch)
+            loss.backward()
+            optimizer.step()
+
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for X_val, y_val in val_loader:
+                output = model(X_val)
+                loss = criterion(output, y_val)
+                val_loss += loss.item() * X_val.size(0)
+
+        val_loss /= len(val_loader.dataset)
+        early_stopping(val_loss, model)
+        if early_stopping.early_stop:
+            break
+
+    early_stopping.load_best_weights(model)
+
+    model.eval()
+    with torch.no_grad():
+        predicted_scaled = model(X_test_tensor).cpu().numpy()
+
+    predictions_inversed = target_scaler.inverse_transform(predicted_scaled)
+    return predictions_inversed.ravel(), len(y_test_raw)
+
+
+def train_and_predict_lightgbm(df_train, df_test, component, feature_cols, config):
+    """Train LightGBM on specific IMF and predict the test set."""
+    X_train_full = df_train[feature_cols]
+    X_test_full = df_test[feature_cols]
+
+    y_shift = -config.FORECAST_HORIZON
+    y_train_shifted = df_train[component].shift(y_shift)
+    y_test_shifted = df_test[component].shift(y_shift)
+
+    train_mask = y_train_shifted.notna()
+    X_train, y_train = X_train_full[train_mask], y_train_shifted[train_mask]
+
+    test_mask = y_test_shifted.notna()
+    X_test, y_test = X_test_full[test_mask], y_test_shifted[test_mask]
+
+    model = lgb.LGBMRegressor(**config.LGB_PARAMS_LOW_FREQ)
+    model.fit(X_train, y_train, eval_set=[(X_test, y_test)], eval_metric='rmse',
+              callbacks=[lgb.early_stopping(50, verbose=False)])
+
+    return model.predict(X_test_full)
+
+
+def evaluate_metrics(predictions, real_values, target_column):
+    """
+    Calculate and print metrics. 
+    [Plotting and detailed CSV saving mechanisms have been removed for public release].
+    """
+    predictions = np.array(predictions)
+    real_values = np.array(real_values) if not isinstance(real_values, pd.Series) else real_values.values
+
+    rmse = np.sqrt(mean_squared_error(real_values, predictions))
+    mae = mean_absolute_error(real_values, predictions)
+    r2 = r2_score(real_values, predictions)
+
+    print(f"\n--- Evaluation Metrics for {target_column} ---")
+    print(f'RMSE: {rmse:.4f}')
+    print(f'MAE:  {mae:.4f}')
+    print(f'R²:   {r2:.4f}')
+    print("---------------------------------------------")
+
+
+# ===================================================================
+# 4. Main Execution Pipeline
+# ===================================================================
+
+if __name__ == "__main__":
+    overall_start_time = time.time()
+    cfg = Config()
+
+    try:
+        # Set seeds for reproducibility
+        torch.manual_seed(42)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(42)
+        np.random.seed(42)
+
+        target_column = cfg.TARGET_COLUMN
+        print(f"\n{'=' * 25} Initialization {'=' * 25}")
+        print(f"Target: {target_column} | Horizon: t+{cfg.FORECAST_HORIZON} | Device: {cfg.DEVICE}")
+
+        # 1. Load Data
+        all_columns_to_load = [cfg.TARGET_COLUMN] + cfg.EXTERNAL_FEATURES
+        df_clean = load_and_clean_data(cfg.FILE_PATH, all_columns_to_load, cfg.TARGET_COLUMN, cfg.TIME_COLUMN)
+
+        if not df_clean.empty:
+            # 2. VMD Decomposition
+            df_imfs = decompose_signal(df_clean, target_column, cfg)
+            df_full = pd.concat([df_clean, df_imfs], axis=1)
+
+            component_cols = df_imfs.columns.tolist()
+            cols_for_lgbm_features = cfg.LOW_FREQ_COMPONENTS + cfg.EXTERNAL_FEATURES
+            
+            # 3. Feature Engineering for Tree Models
+            df_featured_lgbm = create_features_for_lgbm(df_full, cols_for_lgbm_features, cfg)
+
+            all_predictions = {}
+            final_test_size = 0
+
+            # Alignment logic due to rolling windows dropping rows
+            offset = len(df_full) - len(df_featured_lgbm)
+            train_size_offset = int(len(df_featured_lgbm) * cfg.TRAIN_SIZE_RATIO)
+
+            train_df_orig = df_full.iloc[offset: offset + train_size_offset]
+            test_df_orig = df_full.iloc[offset + train_size_offset:]
+
+            train_df_lgbm = df_featured_lgbm.iloc[:train_size_offset]
+            test_df_lgbm = df_featured_lgbm.iloc[train_size_offset:]
+
+            prediction_offset = cfg.LOOK_BACK - 1
+
+            # 4. Sub-model Training & Prediction
+            for component in component_cols:
+                if component in cfg.LOW_FREQ_COMPONENTS:
+                    # Target assignment: LightGBM
+                    targets_to_exclude = [target_column] + component_cols
+                    feature_cols = [col for col in df_featured_lgbm.columns if
+                                    col not in targets_to_exclude and col != 'ds' and col != cfg.TIME_COLUMN]
+
+                    predictions = train_and_predict_lightgbm(train_df_lgbm, test_df_lgbm, component, feature_cols, cfg)
+                    aligned_lgbm_predictions = predictions[prediction_offset:]
+                    all_predictions[component] = aligned_lgbm_predictions
+
+                else:  
+                    # Target assignment: LSTM
+                    predictions, test_size = train_and_predict_lstm(train_df_orig, test_df_orig, component,
+                                                                    cfg.EXTERNAL_FEATURES, cfg)
+                    all_predictions[component] = predictions
+
+                    if final_test_size == 0 and test_size > 0:
+                        final_test_size = test_size
+
+            # 5. Reconstruction & Evaluation
+            if final_test_size > 0:
+                valid_preds = []
+                for comp_name, preds in all_predictions.items():
+                    if len(preds) >= final_test_size:
+                        valid_preds.append(preds[:final_test_size])
+                    else:
+                        padded_preds = np.zeros(final_test_size)
+                        padded_preds[:len(preds)] = preds
+                        valid_preds.append(padded_preds)
+
+                final_predictions = np.sum(valid_preds, axis=0)
+
+                # Extract aligned real values
+                real_values_start_index_in_full = test_df_orig.index[0] + cfg.LOOK_BACK + cfg.FORECAST_HORIZON - 1
+                real_values_end_index_in_full = real_values_start_index_in_full + final_test_size
+                real_values = df_full[target_column].iloc[real_values_start_index_in_full:real_values_end_index_in_full]
+
+                if len(final_predictions) != len(real_values):
+                    min_len = min(len(final_predictions), len(real_values))
+                    final_predictions = final_predictions[:min_len]
+                    real_values = real_values.iloc[:min_len]
+
+                # Output Metrics
+                evaluate_metrics(final_predictions, real_values, target_column)
+
+            else:
+                print(f"Error: Failed to generate valid test predictions.")
+
+    except NotImplementedError as e:
+        print(f"\n[Notice]: {e}")
+    except Exception as e:
+        print(f"\n{'=' * 25} An unexpected error occurred {'=' * 25}")
+        print(f"Error Type: {type(e).__name__}\nError Message: {e}")
+        traceback.print_exc()
+
+    print(f"\n--- Total execution time: {((time.time() - overall_start_time) / 60):.2f} minutes ---")
