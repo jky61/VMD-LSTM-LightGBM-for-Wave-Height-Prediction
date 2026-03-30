@@ -40,8 +40,8 @@ class Config:
 
     # --- LONG-TERM FORECASTING HORIZON ---
     # Core setting for long-term prediction. Represents predicting t+H directly.
-    # e.g., set to 24, 48, or 72 for long-term multi-step ahead forecasting.
-    FORECAST_HORIZON = 48 
+    # e.g., set to 1, 2, or 4 ... for long-term multi-step ahead forecasting.
+    FORECAST_HORIZON = 2  
 
     # --- Deep Learning (LSTM) Hyperparameters ---
     LOOK_BACK = None      # TODO: Define sequence length based on temporal dependency
