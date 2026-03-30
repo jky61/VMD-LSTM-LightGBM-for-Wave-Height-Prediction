@@ -1,0 +1,529 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import os
+import time
+import math
+import matplotlib as mpl
+import traceback
+
+import torch
+import torch.nn as nn
+import torch.optim as optim
+from torch.utils.data import TensorDataset, DataLoader
+
+from sklearn.metrics import mean_squared_error, mean_absolute_error, r2_score
+from vmdpy import VMD
+import lightgbm as lgb
+from sklearn.preprocessing import MinMaxScaler
+
+
+# ===================================================================
+# 1. Configuration (Anonymized for Open Access / Long-term Forecast)
+# ===================================================================
+class Config:
+    # --- Data Paths & Output ---
+    FILE_PATH = 'YOUR_DATASET_PATH.csv'  # TODO: User needs to specify the data path
+    OUTPUT_BASE_DIR = 'LongTerm_Forecasting_Results'
+    
+    # --- Target & Features ---
+    TARGET_COLUMN = 'TARGET_VARIABLE'    # e.g., Significant Wave Height
+    TIME_COLUMN = 'TIME_TIMESTAMP'       
+    EXTERNAL_FEATURES = ['EXTERNAL_FEATURE_1', 'EXTERNAL_FEATURE_2'] # TODO: Add external features here
+    
+    # --- VMD Hyperparameters (Hidden/Abstracted) ---
+    VMD_K = None      # TODO: Specify number of modes based on center frequency analysis
+    VMD_ALPHA = None  # TODO: Specify penalty factor
+    VMD_TAU = 0
+    
+    # Specify which IMFs belong to the specific frequency bands
+    LOW_FREQ_COMPONENTS = ['IMF_X', 'Residual'] 
+
+    # --- LONG-TERM FORECASTING HORIZON ---
+    # Core setting for long-term prediction. Represents predicting t+H directly.
+    # e.g., set to 2, 4, or 8 for long-term multi-step ahead forecasting.
+    FORECAST_HORIZON = 2 
+
+    # --- Deep Learning (LSTM) Hyperparameters ---
+    LOOK_BACK = None      # TODO: Define sequence length based on temporal dependency
+    LSTM_UNITS = None     # Hidden dimension size
+    EPOCHS = None
+    BATCH_SIZE = None
+    LEARNING_RATE = None  # e.g., 0.001
+    EARLY_STOPPING_PATIENCE = 10
+
+    # --- Feature Engineering Parameters ---
+    LAGS = []             # TODO: Define auto-regressive lags (e.g., [1, 2, ...])
+    ROLLING_WINDOWS = []  # TODO: Define rolling statistics windows
+
+    # --- LightGBM Hyperparameters (Abstracted) ---
+    # Highly tuned parameters removed to protect IP.
+    LGB_PARAMS_LOW_FREQ = {
+        'objective': 'regression',
+        'metric': 'rmse',
+        'verbose': -1, 
+        'n_jobs': -1, 
+        'seed': 42
+        # TODO: Add specific tree-depth, learning rate, and regularization parameters here
+    }
+    
+    TRAIN_SIZE_RATIO = 0.8
+    DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+
+
+# ===================================================================
+# 2. Functional Modules
+# ===================================================================
+
+def setup_matplotlib():
+    """Setup Matplotlib for scientific plotting"""
+    mpl.use('Agg')
+    config = {
+        "font.family": 'serif',
+        "font.serif": ['Times New Roman'],
+        "mathtext.fontset": 'stix',
+        "axes.unicode_minus": False
+    }
+    plt.rcParams.update(config)
+
+
+def load_and_clean_data(file_path, all_columns_to_load, target_column, time_col):
+    print("--- Loading and cleaning [Multi-Variate] Long-term Forecasting data ---")
+    try:
+        df = pd.read_csv(file_path)
+    except FileNotFoundError:
+        print(f"Error: File not found '{file_path}'.")
+        return pd.DataFrame()
+
+    if time_col not in df.columns:
+        print(f"Error: Time column '{time_col}' not found.")
+        return pd.DataFrame()
+
+    if time_col not in all_columns_to_load:
+        all_columns_to_load.append(time_col)
+
+    df = df[all_columns_to_load].copy()
+    
+    # Generic time parsing
+    df['ds'] = pd.to_datetime(df[time_col], errors='coerce')
+    df.dropna(subset=['ds'], inplace=True)
+
+    for col in all_columns_to_load:
+        if col != time_col and col != 'ds':
+            df[col] = pd.to_numeric(df[col], errors='coerce')
+
+    df.replace([-99.90, -999.0, -999], np.nan, inplace=True)
+    df.dropna(subset=[target_column], inplace=True)
+
+    numeric_cols = df.select_dtypes(include=np.number).columns.tolist()
+    df[numeric_cols] = df[numeric_cols].interpolate(method='linear', limit_direction='forward')
+    df.bfill(inplace=True); df.ffill(inplace=True)
+
+    df.reset_index(drop=True, inplace=True)
+    print(f"Data cleaning complete, {len(df)} sequences extracted for long-term testing.")
+    return df
+
+
+def decompose_signal(data, target_column, config):
+    print(f"--- Decomposing '{target_column}' into {config.VMD_K} modes using VMD ---")
+    signal = data[target_column].values
+    u, _, _ = VMD(signal, alpha=config.VMD_ALPHA, tau=config.VMD_TAU, K=config.VMD_K, DC=True, init=1, tol=1e-7)
+    imfs = pd.DataFrame(u.T, index=data.index, columns=[f'IMF_{i + 1}' for i in range(config.VMD_K)])
+    imfs.rename(columns={f'IMF_{config.VMD_K}': 'Residual'}, inplace=True)
+    return imfs
+
+
+def create_features_for_lgbm(df, components_to_process, config):
+    print(f"--- Creating long-term features for LightGBM ({', '.join(components_to_process)}) ---")
+    features = df.copy()
+
+    for component in components_to_process:
+        if component in features.columns:
+            for lag in config.LAGS:
+                features[f'{component}_lag_{lag}'] = features[component].shift(lag)
+            for window in config.ROLLING_WINDOWS:
+                features[f'{component}_rolling_mean_{window}'] = features[component].shift(1).rolling(window=window).mean()
+                features[f'{component}_rolling_std_{window}'] = features[component].shift(1).rolling(window=window).std()
+
+    features.dropna(inplace=True)
+    return features
+
+
+def create_lstm_dataset(data, look_back=1, forecast_horizon=1):
+    """
+    Constructs dataset for Direct Multi-step Long-Term Forecasting.
+    Target Y is explicitly shifted by 'forecast_horizon'.
+    """
+    X, Y = [], []
+    for i in range(len(data) - look_back - forecast_horizon + 1):
+        X.append(data[i:(i + look_back), :])
+        y_index = i + look_back + forecast_horizon - 1
+        Y.append(data[y_index, -1])
+    return np.array(X), np.array(Y)
+
+
+# --- PyTorch LSTM Model ---
+class PyTorchLSTM(nn.Module):
+    def __init__(self, input_dim, hidden_dim, output_dim=1, dropout=0.2):
+        super(PyTorchLSTM, self).__init__()
+        self.lstm1 = nn.LSTM(input_dim, hidden_dim, batch_first=True)
+        self.dropout1 = nn.Dropout(dropout)
+        self.lstm2 = nn.LSTM(hidden_dim, hidden_dim // 2, batch_first=True)
+        self.dropout2 = nn.Dropout(dropout)
+        self.fc = nn.Linear(hidden_dim // 2, output_dim)
+
+    def forward(self, x):
+        out, _ = self.lstm1(x)
+        out = self.dropout1(out)
+        out, _ = self.lstm2(out)
+        out = out[:, -1, :]
+        out = self.dropout2(out)
+        out = self.fc(out)
+        return out
+
+
+# --- Early Stopping ---
+class EarlyStoppingPyTorch:
+    def __init__(self, patience=10, verbose=False, delta=0):
+        self.patience = patience
+        self.verbose = verbose
+        self.counter = 0
+        self.best_score = None
+        self.early_stop = False
+        self.val_loss_min = np.Inf
+        self.delta = delta
+        self.best_state_dict = None
+
+    def __call__(self, val_loss, model):
+        score = -val_loss
+        if self.best_score is None:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model)
+        elif score < self.best_score + self.delta:
+            self.counter += 1
+            if self.counter >= self.patience:
+                self.early_stop = True
+        else:
+            self.best_score = score
+            self.save_checkpoint(val_loss, model)
+            self.counter = 0
+
+    def save_checkpoint(self, val_loss, model):
+        self.val_loss_min = val_loss
+        self.best_state_dict = model.state_dict()
+
+    def load_best_weights(self, model):
+        if self.best_state_dict is not None:
+            model.load_state_dict(self.best_state_dict)
+
+
+def train_and_predict_lstm(df_train, df_test, component, external_features, config):
+    print(f"\n--- Training [PyTorch LSTM] model for high-freq component {component} ---")
+    print(f"*** Long-Term Forecast Target: Predicting t+{config.FORECAST_HORIZON} ***")
+
+    lstm_cols = external_features + [component]
+    num_features = len(lstm_cols)
+
+    train_data = df_train[lstm_cols].values
+    test_data = df_test[lstm_cols].values
+
+    scaler = MinMaxScaler(feature_range=(0, 1))
+    scaled_train_data = scaler.fit_transform(train_data)
+    scaled_test_data = scaler.transform(test_data)
+
+    target_scaler = MinMaxScaler(feature_range=(0, 1))
+    target_scaler.fit(df_train[[component]])
+
+    X_train, y_train = create_lstm_dataset(scaled_train_data, config.LOOK_BACK, config.FORECAST_HORIZON)
+    X_test, y_test_raw = create_lstm_dataset(scaled_test_data, config.LOOK_BACK, config.FORECAST_HORIZON)
+
+    if len(X_train) == 0 or len(X_test) == 0:
+        return np.array([]), 0
+
+    X_train_tensor = torch.FloatTensor(X_train).to(config.DEVICE)
+    y_train_tensor = torch.FloatTensor(y_train).view(-1, 1).to(config.DEVICE)
+    X_test_tensor = torch.FloatTensor(X_test).to(config.DEVICE)
+    y_test_tensor = torch.FloatTensor(y_test_raw).view(-1, 1).to(config.DEVICE)
+
+    train_dataset = TensorDataset(X_train_tensor, y_train_tensor)
+    val_dataset = TensorDataset(X_test_tensor, y_test_tensor)
+
+    train_loader = DataLoader(train_dataset, batch_size=config.BATCH_SIZE, shuffle=False)
+    val_loader = DataLoader(val_dataset, batch_size=config.BATCH_SIZE, shuffle=False)
+
+    model = PyTorchLSTM(input_dim=num_features, hidden_dim=config.LSTM_UNITS).to(config.DEVICE)
+    criterion = nn.MSELoss()
+    optimizer = optim.Adam(model.parameters(), lr=config.LEARNING_RATE)
+
+    early_stopping = EarlyStoppingPyTorch(patience=config.EARLY_STOPPING_PATIENCE, verbose=False)
+
+    for epoch in range(config.EPOCHS):
+        model.train()
+        for X_batch, y_batch in train_loader:
+            optimizer.zero_grad()
+            output = model(X_batch)
+            loss = criterion(output, y_batch)
+            loss.backward()
+            optimizer.step()
+
+        model.eval()
+        val_loss = 0.0
+        with torch.no_grad():
+            for X_val, y_val in val_loader:
+                output = model(X_val)
+                loss = criterion(output, y_val)
+                val_loss += loss.item() * X_val.size(0)
+        val_loss /= len(val_loader.dataset)
+
+        early_stopping(val_loss, model)
+        if early_stopping.early_stop:
+            break
+
+    early_stopping.load_best_weights(model)
+
+    model.eval()
+    with torch.no_grad():
+        predicted_scaled = model(X_test_tensor).cpu().numpy()
+
+    predictions_inversed = target_scaler.inverse_transform(predicted_scaled)
+    return predictions_inversed.ravel(), len(y_test_raw)
+
+
+def train_and_predict_lightgbm(df_train, df_test, component, feature_cols, config):
+    print(f"\n--- Training [LightGBM] model for low-freq component {component} ---")
+    print(f"*** Long-Term Forecast Target: Predicting t+{config.FORECAST_HORIZON} ***")
+
+    X_train_full = df_train[feature_cols]
+    X_test_full = df_test[feature_cols]
+
+    y_shift = -config.FORECAST_HORIZON
+    y_train_shifted = df_train[component].shift(y_shift)
+    y_test_shifted = df_test[component].shift(y_shift)
+
+    train_mask = y_train_shifted.notna()
+    X_train, y_train = X_train_full[train_mask], y_train_shifted[train_mask]
+
+    test_mask = y_test_shifted.notna()
+    X_test, y_test = X_test_full[test_mask], y_test_shifted[test_mask]
+
+    model = lgb.LGBMRegressor(**config.LGB_PARAMS_LOW_FREQ)
+    model.fit(X_train, y_train, eval_set=[(X_test, y_test)], eval_metric='rmse',
+              callbacks=[lgb.early_stopping(50, verbose=False)])
+
+    return model.predict(X_test_full)
+
+
+def evaluate_and_plot(predictions, real_values, test_dates, output_dir, target_column, horizon):
+    """Evaluation and plotting module"""
+    predictions = np.array(predictions)
+    real_values = np.array(real_values) if not isinstance(real_values, pd.Series) else real_values.values
+    test_dates = np.array(test_dates) if not isinstance(test_dates, pd.Series) else test_dates.values
+
+    rmse = np.sqrt(mean_squared_error(real_values, predictions))
+    mae = mean_absolute_error(real_values, predictions)
+    r2 = r2_score(real_values, predictions)
+
+    english_target_name = f"Target_{target_column}"
+
+    print(f"\n--- Evaluation (Target: {english_target_name}) ---")
+    print(f'RMSE: {rmse:.4f}')
+    print(f'MAE:  {mae:.4f}')
+    print(f'R²:   {r2:.4f}')
+
+    print(">>> Saving plot data to CSV...")
+    real_val_flat = real_values.flatten()
+    pred_val_flat = predictions.flatten()
+
+    min_len = min(len(real_val_flat), len(pred_val_flat), len(test_dates))
+    real_val_flat = real_val_flat[:min_len]
+    pred_val_flat = pred_val_flat[:min_len]
+    test_dates = test_dates[:min_len]
+
+    df_plot_data = pd.DataFrame({
+        'Date': test_dates,
+        'Time_Step_Index': np.arange(min_len),
+        'True_Value': real_val_flat,
+        'Predicted_Value': pred_val_flat
+    })
+
+    df_plot_data['Date'] = pd.to_datetime(df_plot_data['Date']).dt.strftime('%Y-%m-%d %H:%M:%S')
+
+    import time as systime
+    time_str = systime.strftime("%H%M%S")
+    csv_filename = f'plot_data_{english_target_name}_{time_str}.csv'
+
+    csv_path = os.path.join(output_dir, csv_filename)
+    df_plot_data.to_csv(csv_path, index=False)
+    print(f">>> Data saved to: {csv_path}")
+
+    # --- 1. Time-Series Plot ---
+    plt.figure(figsize=(12, 6))
+    plt.plot(df_plot_data['Time_Step_Index'], df_plot_data['True_Value'],
+             label='True Values', color='blue', linewidth=2, linestyle='-', zorder=1)
+    plt.plot(df_plot_data['Time_Step_Index'], df_plot_data['Predicted_Value'],
+             label=f'Predicted (t+{horizon})',
+             color='red', linewidth=1.5, linestyle='--', alpha=0.7, zorder=2)
+
+    plt.title(f"Long-Term Forecast - {english_target_name}", fontsize=15)
+    plt.ylabel("Value")
+    plt.xlabel("Time Step")
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+
+    ts_filename = f'01_timeseries_{english_target_name}.png'
+    plt.savefig(os.path.join(output_dir, ts_filename), bbox_inches='tight', pad_inches=0.05)
+    plt.close()
+
+    # --- 2. Scatter Plot ---
+    plt.figure(figsize=(8, 8))
+    plt.scatter(real_val_flat, pred_val_flat, alpha=0.5, s=15, color='blue', label='Predictions')
+
+    min_val = min(real_val_flat.min(), pred_val_flat.min())
+    max_val = max(real_val_flat.max(), pred_val_flat.max())
+    buffer = (max_val - min_val) * 0.05
+    plot_min = 0
+    plot_max = math.ceil(max_val + buffer)
+
+    plt.plot([plot_min, plot_max], [plot_min, plot_max],
+             color='red', linestyle='--', linewidth=1.5, label='Ideal Line (y=x)')
+
+    slope, intercept = np.polyfit(real_val_flat, pred_val_flat, 1)
+
+    plt.plot([plot_min, plot_max], [slope * x + intercept for x in [plot_min, plot_max]],
+             color='orange', linestyle='-', linewidth=2,
+             label='Fit Line (slope={:.3f})'.format(slope))
+
+    plt.plot([plot_min, plot_max], [slope * x + intercept - (1.96 * rmse) for x in [plot_min, plot_max]],
+             color='blue', linestyle='--', linewidth=1, label='95% Prediction Band')
+    plt.plot([plot_min, plot_max], [slope * x + intercept + (1.96 * rmse) for x in [plot_min, plot_max]],
+             color='blue', linestyle='--', linewidth=1)
+
+    plt.title(f'Predicted vs Measured - {english_target_name}', fontsize=14)
+    plt.xlabel('Measured Values', fontsize=14)
+    plt.ylabel('Predicted Values', fontsize=14)
+    plt.tick_params(axis='both', which='major', labelsize=12)
+
+    legend_labels = ['Predictions', 'Ideal Line (y=x)', 'Fit Line (slope={:.3f})'.format(slope), '95% Prediction Band']
+    plt.legend(labels=legend_labels, fontsize=10)
+
+    plt.grid(True, linestyle=':', alpha=0.7)
+    plt.axis('equal')
+    plt.xlim(plot_min, plot_max)
+    plt.ylim(plot_min, plot_max)
+    plt.tight_layout()
+
+    sc_filename = f'02_scatter_{english_target_name}.png'
+    plt.savefig(os.path.join(output_dir, sc_filename), bbox_inches='tight', pad_inches=0.05)
+    plt.close()
+
+
+# ===================================================================
+# 4. Main Execution
+# ===================================================================
+if __name__ == "__main__":
+    overall_start_time = time.time()
+    cfg = Config()
+    setup_matplotlib()
+
+    try:
+        torch.manual_seed(42)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed(42)
+        np.random.seed(42)
+
+        target_column = cfg.TARGET_COLUMN
+        print(f"\n{'=' * 25} Processing Target: {target_column} (Predicting t+{cfg.FORECAST_HORIZON}) {'=' * 25}")
+        print(f"Using Device: {cfg.DEVICE}")
+        point_start_time = time.time()
+
+        output_dir_for_target = os.path.join(cfg.OUTPUT_BASE_DIR, target_column.replace('_', ''))
+        if not os.path.exists(output_dir_for_target):
+            os.makedirs(output_dir_for_target)
+
+        all_columns_to_load = [cfg.TARGET_COLUMN] + cfg.EXTERNAL_FEATURES
+        df_clean = load_and_clean_data(cfg.FILE_PATH, all_columns_to_load, cfg.TARGET_COLUMN, cfg.TIME_COLUMN)
+
+        if not df_clean.empty:
+            df_imfs = decompose_signal(df_clean, target_column, cfg)
+            df_full = pd.concat([df_clean, df_imfs], axis=1)
+
+            component_cols = df_imfs.columns.tolist()
+            cols_for_lgbm_features = cfg.LOW_FREQ_COMPONENTS + cfg.EXTERNAL_FEATURES
+            df_featured_lgbm = create_features_for_lgbm(df_full, cols_for_lgbm_features, cfg)
+
+            all_predictions = {}
+            final_test_size = 0
+
+            offset = len(df_full) - len(df_featured_lgbm)
+            train_size_offset = int(len(df_featured_lgbm) * cfg.TRAIN_SIZE_RATIO)
+
+            train_df_orig = df_full.iloc[offset: offset + train_size_offset]
+            test_df_orig = df_full.iloc[offset + train_size_offset:]
+
+            train_df_lgbm = df_featured_lgbm.iloc[:train_size_offset]
+            test_df_lgbm = df_featured_lgbm.iloc[train_size_offset:]
+
+            prediction_offset = cfg.LOOK_BACK - 1
+
+            for component in component_cols:
+                if component in cfg.LOW_FREQ_COMPONENTS:
+                    targets_to_exclude = [target_column] + component_cols
+                    feature_cols = [col for col in df_featured_lgbm.columns if
+                                    col not in targets_to_exclude and col != 'ds' and col != cfg.TIME_COLUMN]
+
+                    predictions = train_and_predict_lightgbm(train_df_lgbm, test_df_lgbm, component, feature_cols, cfg)
+                    aligned_lgbm_predictions = predictions[prediction_offset:]
+                    all_predictions[component] = aligned_lgbm_predictions
+
+                else: 
+                    predictions, test_size = train_and_predict_lstm(train_df_orig, test_df_orig, component,
+                                                                    cfg.EXTERNAL_FEATURES, cfg)
+                    all_predictions[component] = predictions
+
+                    if final_test_size == 0 and test_size > 0:
+                        final_test_size = test_size
+
+            if final_test_size > 0:
+                valid_preds = []
+                for comp_name, preds in all_predictions.items():
+                    if len(preds) >= final_test_size:
+                        valid_preds.append(preds[:final_test_size])
+                    else:
+                        padded_preds = np.zeros(final_test_size)
+                        padded_preds[:len(preds)] = preds
+                        valid_preds.append(padded_preds)
+
+                final_predictions = np.sum(valid_preds, axis=0)
+
+                real_values_start_index_in_full = test_df_orig.index[0] + cfg.LOOK_BACK + cfg.FORECAST_HORIZON - 1
+                real_values_end_index_in_full = real_values_start_index_in_full + final_test_size
+
+                real_values = df_full[target_column].iloc[real_values_start_index_in_full:real_values_end_index_in_full]
+                test_dates = df_full['ds'].iloc[real_values_start_index_in_full:real_values_end_index_in_full]
+
+                if len(final_predictions) != len(real_values):
+                    min_len = min(len(final_predictions), len(real_values))
+                    final_predictions = final_predictions[:min_len]
+                    real_values = real_values.iloc[:min_len]
+                    test_dates = test_dates.iloc[:min_len]
+
+                evaluate_and_plot(
+                    final_predictions,
+                    real_values,
+                    test_dates,  
+                    output_dir_for_target,
+                    target_column,
+                    cfg.FORECAST_HORIZON
+                )
+            else:
+                print(f"Error: Failed to generate valid test predictions.")
+
+            point_end_time = time.time()
+            print(f"--- Processing complete. Time taken: {((point_end_time - point_start_time) / 60):.2f} minutes ---")
+
+    except Exception as e:
+        print(f"\n{'=' * 25} An unexpected error occurred {'=' * 25}")
+        traceback.print_exc()
+
+    overall_end_time = time.time()
+    print(f"\n--- Total execution time: {((overall_end_time - overall_start_time) / 60):.2f} minutes ---")
